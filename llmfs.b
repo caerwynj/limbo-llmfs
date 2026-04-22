@@ -85,6 +85,7 @@ default_model :=	"openai/gpt-4.1-nano";
 apikey:		string;
 apich:		chan of ref ApiResult;
 user:		string;
+model_info:	string;
 
 nomod(path: string)
 {
@@ -144,6 +145,8 @@ init(nil: ref Draw->Context, args: list of string)
 	user = readfile("/dev/user");
 	if(user == nil)
 		user = "llmfs";
+
+	model_info = fetchmodelinfo(default_model);
 
 	conns = array[16] of ref LlmConn;
 	apich = chan of ref ApiResult;
@@ -470,8 +473,7 @@ serveloop(tchan: chan of ref Tmsg, srv: ref Styxserver, pidc: chan of int,
 			Qclone =>
 				srv.reply(styxservers->readbytes(m, c.data));
 			Qinfo =>
-				info := sprint("model: %s\n", default_model);
-				srv.reply(styxservers->readstr(m, info));
+				srv.reply(styxservers->readstr(m, model_info));
 			Qctl =>
 				conn := findconn(c.path);
 				if(conn == nil) {
@@ -664,6 +666,119 @@ parsectl(conn: ref LlmConn, cmd: string): string
 		return "unknown ctl command";
 	}
 	return nil;
+}
+
+# Query /api/v1/models at startup and format the entry for `model`.
+fetchmodelinfo(model: string): string
+{
+	fallback := sprint("model: %s\n", model);
+
+	(url, uerr) := Url.unpack("https://openrouter.ai/api/v1/models");
+	if(uerr != nil) {
+		sys->fprint(sys->fildes(2), "llmfs: models url: %s\n", uerr);
+		return fallback;
+	}
+
+	hdrs: list of (string, string);
+	if(apikey != nil)
+		hdrs = ("Authorization", "Bearer " + apikey) :: hdrs;
+	hdrs = ("Accept", "application/json") :: hdrs;
+
+	(nil, nil, rfd, gerr) := http->get(url, Hdrs.new(hdrs));
+	if(gerr != nil) {
+		sys->fprint(sys->fildes(2), "llmfs: models get: %s\n", gerr);
+		return fallback;
+	}
+
+	rbuf := array[65536] of byte;
+	result := "";
+	while((n := sys->read(rfd, rbuf, len rbuf)) > 0)
+		result += string rbuf[:n];
+
+	rbio := bufio->sopen(result);
+	(jv, jerr) := json->readjson(rbio);
+	if(jerr != nil) {
+		sys->fprint(sys->fildes(2), "llmfs: models json: %s\n", jerr);
+		return fallback;
+	}
+
+	data := jv.get("data");
+	if(data == nil)
+		return fallback;
+	pick da := data {
+	Array =>
+		for(i := 0; i < len da.a; i++) {
+			mid := da.a[i].get("id");
+			if(mid == nil)
+				continue;
+			pick ms := mid {
+			String =>
+				if(ms.s == model)
+					return formatmodel(da.a[i]);
+			}
+		}
+	}
+	return fallback;
+}
+
+formatmodel(m: ref JValue): string
+{
+	s := "model: " + jvtext(m, "id") + "\n";
+	v := jvtext(m, "name");
+	if(v != "")
+		s += "name: " + v + "\n";
+	v = jvtext(m, "context_length");
+	if(v != "")
+		s += "context_length: " + v + "\n";
+
+	tp := m.get("top_provider");
+	if(tp != nil) {
+		v = jvtext(tp, "max_completion_tokens");
+		if(v != "")
+			s += "max_completion_tokens: " + v + "\n";
+		v = jvtext(tp, "is_moderated");
+		if(v != "")
+			s += "is_moderated: " + v + "\n";
+	}
+
+	p := m.get("pricing");
+	if(p != nil) {
+		v = jvtext(p, "prompt");
+		if(v != "")
+			s += "pricing_prompt: " + v + "\n";
+		v = jvtext(p, "completion");
+		if(v != "")
+			s += "pricing_completion: " + v + "\n";
+	}
+
+	arch := m.get("architecture");
+	if(arch != nil) {
+		v = jvtext(arch, "modality");
+		if(v != "")
+			s += "modality: " + v + "\n";
+		v = jvtext(arch, "tokenizer");
+		if(v != "")
+			s += "tokenizer: " + v + "\n";
+	}
+	return s;
+}
+
+jvtext(obj: ref JValue, key: string): string
+{
+	if(obj == nil)
+		return "";
+	v := obj.get(key);
+	if(v == nil)
+		return "";
+	pick x := v {
+	String =>	return x.s;
+	Int =>		return string x.value;
+	Real =>		return string x.value;
+	True =>		return "true";
+	False =>	return "false";
+	Null =>		return "";
+	}
+	return "";
 }
 
 # API call goroutine
