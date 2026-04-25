@@ -1,0 +1,190 @@
+.TH LLMFS 4
+.SH NAME
+llmfs \- interface to LLM file system
+.SH SYNOPSIS
+.B llmfs
+[
+.B -D
+] [
+.BI -m " mntpt"
+] [
+.BI -k " apikey"
+] [
+.BI -M " model"
+]
+.PP
+.B /n/llm/clone
+.br
+.B /n/llm/info
+.br
+.BI /n/llm/ n /ctl
+.br
+.BI /n/llm/ n /data
+.br
+.BI /n/llm/ n /status
+.br
+.BI /n/llm/ n /chat/system
+.br
+.BI /n/llm/ n /chat/user
+.br
+.BI /n/llm/ n /chat/assistant
+.SH DESCRIPTION
+.I Llmfs
+provides a way to interact with an LLM over a filesystem interface.
+It serves its hierarchy on
+.I mntpt
+(default
+.BR /n/llm ),
+issuing requests to the OpenRouter chat completions API
+.RB ( https://openrouter.ai/api/v1/chat/completions ).
+The
+.B -D
+option enables Styx server tracing.
+.B -M
+sets the default model used for new connections
+(default
+.BR openai/gpt-4.1-nano ).
+.B -k
+supplies the OpenRouter API key;
+if absent, the key is read from
+.BR /env/OPENROUTER_API_KEY .
+.PP
+The top of the hierarchy contains a
+.B clone
+file, an
+.B info
+file and zero or more numbered directories.
+Each numbered directory represents a distinct connection to the LLM
+and contains the files
+.BR ctl ,
+.BR data ,
+.BR status ,
+and a
+.B chat
+subdirectory used as described below.
+Opening the
+.B clone
+file reserves a connection: it is equivalent to opening the
+.B ctl
+file of an unused connection directory, creating a new one if necessary.
+.PP
+The file
+.B ctl
+controls a connection.
+When read, it returns the decimal number
+.I n
+of its connection directory.
+Thus, opening and reading
+.B clone
+allocates a connection directory and reveals the number of the allocated directory,
+allowing the other files to be named (eg,
+.BI /n/llm/ n /data\fR).
+.PP
+.B Ctl
+accepts the following textual commands:
+.TP
+.BI "temp " n
+Set the sampling temperature to
+.IR n ,
+a real number (typically between 0 and 2).
+Issue this request before starting a prompt.
+.TP
+.BI "top " n
+Set nucleus sampling probability
+.RI ( top_p )
+to
+.IR n ,
+a real between 0 and 1.
+.TP
+.BI "max_tokens " n
+Limit the number of tokens to generate to
+.IR n .
+.TP
+.BI "seed " n
+Set the seed for sampling.
+.TP
+.BI "model " name
+Override the model used for this connection (eg,
+.BR anthropic/claude-sonnet-4.5 ).
+.TP
+.BI "mode " stream|block
+Accepted for compatibility but ignored:
+responses are always delivered in a single block when generation completes.
+.TP
+.B reset
+Return the connection to the idle state, clearing any
+system, user, data, and assistant content accumulated so far.
+.PP
+The
+.B data
+file provides a connection to the raw input and output of the LLM.
+It must be opened separately for reading and for writing.
+Writing to
+.B data
+appends to a plain prompt; closing the writer starts generation.
+Reading
+.B data
+returns the generated text once generation completes;
+reads issued while generation is in progress block until it finishes.
+.PP
+The
+.B chat
+directory is a structured alternative for instruction or chat models.
+Writing to
+.B chat/system
+sets the system prompt.
+Writing to
+.B chat/user
+sets the user message; closing the writer submits the chat and
+makes the model's reply available in the read-only file
+.BR chat/assistant .
+As with
+.BR data ,
+reads on
+.B chat/assistant
+block until generation completes.
+Writes that start at offset 0 replace the previous contents of
+.B chat/system
+or
+.BR chat/user ;
+later writes append.
+.PP
+Once started, a request runs until the API returns a response or an error;
+closing all files for a connection abandons interest in the result.
+.PP
+The read-only
+.B status
+file provides a single word giving the state of the connection:
+.BR Idle ,
+.BR Prompting ,
+.BR Generating ,
+or
+.BR Done .
+.PP
+The read-only
+.B info
+file gives basic metadata about the default model.
+.SH SOURCE
+.B llmfs.b
+.SH SEE ALSO
+.IR styxservers (2),
+.IR mhttp (2)
+.SH DIAGNOSTICS
+A
+.B write
+to
+.B ctl
+returns with an error and sets the error string if
+a command is malformed or unknown.
+A
+.B read
+from
+.B data
+or
+.B chat/assistant
+returns an error if the upstream API call fails;
+the error text describes the failure (HTTP status, dial error, or parse error).
+.SH BUGS
+The
+.B mode
+command is silently ignored; streaming output is not implemented.
