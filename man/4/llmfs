@@ -23,11 +23,25 @@ llmfs \- interface to LLM file system
 .br
 .BI /n/llm/ n /status
 .br
-.BI /n/llm/ n /chat/system
+.BI /n/llm/ n /system
 .br
-.BI /n/llm/ n /chat/user
+.BI /n/llm/ n /tools
 .br
-.BI /n/llm/ n /chat/assistant
+.BI /n/llm/ n /tool_choice
+.br
+.BI /n/llm/ n /messages/clone
+.br
+.BI /n/llm/ n /messages/ m /role
+.br
+.BI /n/llm/ n /messages/ m /content
+.br
+.BI /n/llm/ n /messages/ m /name
+.br
+.BI /n/llm/ n /messages/ m /tool_call_id
+.br
+.BI /n/llm/ n /messages/ m /tool_calls
+.br
+.BI /n/llm/ n /messages/ m /finish_reason
 .SH DESCRIPTION
 .I Llmfs
 provides a way to interact with an LLM over a filesystem interface.
@@ -53,20 +67,25 @@ The top of the hierarchy contains a
 .B clone
 file, an
 .B info
-file and zero or more numbered directories.
-Each numbered directory represents a distinct connection to the LLM
-and contains the files
-.BR ctl ,
-.BR data ,
-.BR status ,
-and a
-.B chat
-subdirectory used as described below.
-Opening the
+file, and zero or more numbered directories.
+Each numbered directory represents a distinct connection
+to the LLM. Opening the
 .B clone
 file reserves a connection: it is equivalent to opening the
 .B ctl
-file of an unused connection directory, creating a new one if necessary.
+file of an unused connection directory, creating a new one
+if necessary.
+.PP
+A connection directory contains
+.BR ctl ,
+.BR data ,
+.BR status ,
+.BR system ,
+.BR tools ,
+.BR tool_choice ,
+and a
+.B messages
+subdirectory described below.
 .PP
 The file
 .B ctl
@@ -76,48 +95,103 @@ When read, it returns the decimal number
 of its connection directory.
 Thus, opening and reading
 .B clone
-allocates a connection directory and reveals the number of the allocated directory,
-allowing the other files to be named (eg,
-.BI /n/llm/ n /data\fR).
+allocates a connection directory and reveals the number of the
+allocated directory, allowing the other files to be named (eg,
+.BI /n/llm/ n /messages\fR).
 .PP
 .B Ctl
 accepts the following textual commands:
 .TP
 .BI "temp " n
-Set the sampling temperature to
-.IR n ,
-a real number (typically between 0 and 2).
-Issue this request before starting a prompt.
+Sampling temperature
+.RI ( n
+real, typically 0\(en2). Issue before
+.BR send .
 .TP
 .BI "top " n
-Set nucleus sampling probability
-.RI ( top_p )
-to
-.IR n ,
-a real between 0 and 1.
+Nucleus sampling probability
+.RI ( top_p ),
+real between 0 and 1.
 .TP
 .BI "max_tokens " n
-Limit the number of tokens to generate to
-.IR n .
+Limit the number of tokens to generate.
 .TP
 .BI "seed " n
-Set the seed for sampling.
+Sampling seed.
 .TP
 .BI "model " name
-Override the model used for this connection (eg,
-.BR anthropic/claude-sonnet-4.5 ).
+Override the model for this connection.
 .TP
-.BI "mode " stream|block
-Accepted for compatibility but ignored:
-responses are always delivered in a single block when generation completes.
+.BI "tool_choice " v
+Set the request's
+.B tool_choice
+field. Value is
+.BR auto ,
+.BR none ,
+.BR required ,
+or a function name.
+.TP
+.BI "transform " on|off
+Toggle OpenRouter's
+.B middle-out
+context-length transform (default on).
+With
+.B middle-out
+enabled, OpenRouter drops middle messages when the request
+exceeds the model context.
+.TP
+.B send
+Snapshot the current
+.BR system ,
+.BR tools ,
+.BR tool_choice ,
+and
+.B messages
+contents and start an API call. Sets
+.B status
+to
+.B Generating
+until the response arrives. Subsequent writes to
+.B system
+or
+.B tools
+do not affect the in-flight call.
+.TP
+.B cancel
+Abort an in-flight call. State returns to
+.B Idle
+and any pending reads on the unborn assistant turn return an
+error.
+.TP
+.BI "trim " n
+Drop the
+.I n
+oldest non-empty messages from
+.BR messages/ .
+.TP
+.BI "trim keep " k
+Drop oldest messages until at most
+.I k
+remain.
+Neither form of
+.B trim
+touches
+.B system
+or
+.BR tools .
 .TP
 .B reset
-Return the connection to the idle state, clearing any
-system, user, data, and assistant content accumulated so far.
+Return the connection to the idle state, clearing
+.BR system ,
+.BR tools ,
+.BR tool_choice ,
+.BR data ,
+and
+.BR messages/ .
 .PP
 The
 .B data
-file provides a connection to the raw input and output of the LLM.
+file is the simple one-shot interface (no tools, no multi-turn).
 It must be opened separately for reading and for writing.
 Writing to
 .B data
@@ -125,45 +199,165 @@ appends to a plain prompt; closing the writer starts generation.
 Reading
 .B data
 returns the generated text once generation completes;
-reads issued while generation is in progress block until it finishes.
+reads issued while generation is in progress block until it
+finishes. The
+.B data
+interface does not interact with
+.BR system ,
+.BR tools ,
+or
+.BR messages/ .
 .PP
 The
-.B chat
-directory is a structured alternative for instruction or chat models.
+.B messages
+directory is the multi-turn interface. It contains a
+.B clone
+file (open and read to allocate a new turn slot, returning the
+turn index
+.IR m )
+and one numbered subdirectory per allocated turn.
+Each turn subdirectory contains the per-message scalar files:
+.TP
+.B role
+One of
+.BR user ", " developer ", " assistant ", " tool .
+For turns appended by the server in response to a
+.B send
+the role is always
+.BR assistant .
+.TP
+.B content
+Plain-text message content. Read-write for caller-created turns,
+read-only for assistant turns. A read on the
+.B content
+file of the
+.B not-yet-existing
+assistant turn (turn index equal to the next free slot at
+.B send
+time) blocks until generation completes.
+.TP
+.B name
+Optional name attached to the message.
+.TP
+.B tool_call_id
+For
+.B role=tool
+turns: the
+.B id
+from the assistant's
+.B tool_calls
+entry that this turn answers.
 Writing to
-.B chat/system
-sets the system prompt.
-Writing to
-.B chat/user
-sets the user message; closing the writer submits the chat and
-makes the model's reply available in the read-only file
-.BR chat/assistant .
-As with
-.BR data ,
-reads on
-.B chat/assistant
-block until generation completes.
-Writes that start at offset 0 replace the previous contents of
-.B chat/system
-or
-.BR chat/user ;
-later writes append.
+.B tool_call_id
+on a turn whose role is unset implies
+.BR role=tool .
+.TP
+.B tool_calls
+Read-only. For assistant turns: the JSON array of
+.B tool_calls
+returned by the API, verbatim. Empty if the assistant produced
+plain text.
+.TP
+.B finish_reason
+Read-only. For assistant turns: one of
+.BR stop ", " tool_calls ", " length ", " content_filter ", " error .
 .PP
-Once started, a request runs until the API returns a response or an error;
-closing all files for a connection abandons interest in the result.
+A turn directory may be removed
+.RB ( "remove " m )
+to drop just that turn from the conversation; remaining turns
+keep their indices (gaps are allowed).
+.PP
+The files
+.B system
+and
+.B tools
+hold the system prompt (plain text) and the tool catalogue
+(markdown, see
+.B Tools format
+below). Both are read/write at any time during the connection;
+each
+.B "ctl send"
+takes a private snapshot of their current contents, so a write
+that lands while a call is in flight is picked up by the next
+.B send
+without disturbing the running call. Writes that begin at
+offset 0 replace the previous contents; later writes append.
+.PP
+.B tool_choice
+holds the value passed to the API as
+.BR tool_choice .
 .PP
 The read-only
 .B status
-file provides a single word giving the state of the connection:
-.BR Idle ,
-.BR Prompting ,
-.BR Generating ,
-or
-.BR Done .
-.PP
+file gives the current connection state:
+.BR Idle ", " Prompting ", " Generating ", or " Done .
 The read-only
 .B info
-file gives basic metadata about the default model.
+file gives basic metadata about the default model
+(includes
+.B context_length
+which is the size of the model's input window).
+.SH TOOLS FORMAT
+The
+.B tools
+file is markdown. One H1 header per tool; the body lines under
+the header are the tool description; a fenced
+.B json
+code block holds the JSON Schema for the tool's parameters.
+A tool with no fenced block gets the schema
+.BR {"type":"object","properties":{}} .
+For example:
+.PP
+.EX
+# get_weather
+Get the current weather for a location.
+
+\\`\\`\\`json
+{"type":"object",
+ "properties":{"location":{"type":"string","description":"City"}},
+ "required":["location"]}
+\\`\\`\\`
+
+# get_time
+Return the current time in ISO 8601.
+.EE
+.SH TOOL CALL LOOP
+After
+.B send
+the server appends an
+.B assistant
+turn to
+.BR messages/ .
+If
+.B finish_reason
+is
+.B tool_calls
+the assistant turn's
+.B tool_calls
+file holds a JSON array such as
+.PP
+.EX
+[{"id":"call_abc","type":"function",
+  "function":{"name":"get_weather","arguments":"{\\"location\\":\\"Paris\\"}"}}]
+.EE
+.PP
+For each entry the caller executes the function locally, allocates
+a new turn under
+.BR messages/clone ,
+sets
+.B tool_call_id
+to the entry's
+.BR id ,
+writes the function result to
+.BR content ,
+and writes
+.B send
+to
+.B ctl
+again. The loop terminates when
+.B finish_reason
+is
+.BR stop .
 .SH SOURCE
 .B llmfs.b
 .SH SEE ALSO
@@ -174,17 +368,28 @@ A
 .B write
 to
 .B ctl
-returns with an error and sets the error string if
-a command is malformed or unknown.
+returns an error if a command is malformed or unknown, or if
+.B send
+is issued with no
+.B system
+prompt and no messages.
 A
 .B read
-from
+from a per-message scalar file returns an error if the upstream
+API call fails; the error text describes the failure (HTTP
+status, dial error, parse error, or
+.B "tools: ..."
+for a malformed tools markdown block).
+A read from
 .B data
-or
-.B chat/assistant
-returns an error if the upstream API call fails;
-the error text describes the failure (HTTP status, dial error, or parse error).
+or from a not-yet-created
+.B assistant
+turn blocks until generation completes or the call is
+.BR cancel led.
 .SH BUGS
-The
-.B mode
-command is silently ignored; streaming output is not implemented.
+Token counts are not tracked locally, so context-length overflow
+is detected only by the API's 4xx response. Use
+.B "ctl trim"
+or rely on
+.B middle-out
+to keep requests within the window.
